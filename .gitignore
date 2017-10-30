@@ -1,0 +1,22 @@
+###############################################################################
+# Gitignore: file that specifies intentionally files NOT to track.
+#            see more at https://git-scm.com/docs/gitignore
+###############################################################################
+
+# Object files
+*.o
+*.elf
+*.obj
+
+# Libraries
+*.so
+*.a
+
+# Debug files
+*.dSYM/
+
+# Swap files
+*.swp
+
+# object files
+mdriver*
