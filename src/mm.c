@@ -60,7 +60,7 @@
 
 // pointer to first block
 size_t * first_block;
-
+size_t * epilog_block;
 #ifdef DEBUG
 
 //debug functions
@@ -96,6 +96,7 @@ int mm_init(void) {
     *(first_block++) = 0;
     *(first_block++) = 0;
     
+    epilog_block = first_block;
 #ifdef DEBUG
     printf("%p %p %x %x\n", initial_heap, first_block, initial_heap[0], initial_heap[1]);
 #endif
@@ -180,8 +181,17 @@ void *mm_malloc(size_t size) {
     } else {
         // extend the heap if fails
 
-        bp = (size_t *) mem_sbrk(asize);
-        if(!bp) return NULL;
+        // if last block is free area
+        if(GET_FREE_BIT(GET_PREV_FTRP(epilog_block))) {
+            bp = PREV_BLKP(epilog_block);
+            size_t last_block_size = GET_SIZE(HDRP(bp));
+
+            // expand the difference
+            mem_sbrk(asize - last_block_size);
+        } else {
+            bp = (size_t *) mem_sbrk(asize);
+            if(!bp) return NULL;
+        }
 
         // now bp points to preparatory new block..
         // set the new block at bp
