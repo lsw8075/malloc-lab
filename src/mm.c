@@ -1,5 +1,5 @@
 /*
- * mm-explicit.c - The first-fit, explcit free list based malloc package.
+ * mm-realloc.c - The first-fit, LIFO explcit free list based malloc package with better realloc.
  *
  */
 
@@ -45,6 +45,8 @@
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 
+// size_t version of 
+
 // use alloc bit as free bit
 // if alloc bit is 0, it indicates allocated block
 // if alloc bit is 1, it indicates free block
@@ -64,7 +66,6 @@
 #define PREDP(fbp) ((size_t **)(fbp))
 #define SUCCP(fbp) ((size_t **)((char *)(fbp) + WSIZE))
 
-// #define DEBUG
 #define BOLDSTART "\033[1m"
 #define BOLDEND "\033[0m"
 // pointers
@@ -365,19 +366,100 @@ void *mm_realloc(void *ptr, size_t size)
     dump_funcname("mm_realloc");
 #endif
 
-  void *oldptr = ptr;
-  void *newptr;
-  size_t copySize;
+    // if ptr == NULL, malloc
+    if(!ptr) return mm_malloc(size);
+    
+    // if size == 0, free
+    if(!size) {
+        mm_free(ptr);
+        return NULL;
+    }
 
-  newptr = mm_malloc(size);
-  if (newptr == NULL)
-    return NULL;
-  copySize = mm_size(ptr);
-  if (size < copySize)
-    copySize = size;
-  memcpy(newptr, oldptr, copySize);
-  mm_free(oldptr);
-  return newptr;
+    size_t asize = get_adjusted_size(size);
+    size_t cur_size = GET_SIZE(HDRP(ptr));
+
+    void * oldptr = ptr;
+#ifdef DEBUG
+    printf("realloc %p(%d -> %d)\n", ptr, cur_size, asize);
+#endif
+
+    // first check whether surrounding free blocks exist
+    size_t prev_free = GET_FREE_BIT(GET_PREV_FTRP(ptr));
+    size_t next_free = GET_FREE_BIT(GET_NEXT_HDRP(ptr));
+
+    size_t prev_size = GET_SIZE(GET_PREV_FTRP(ptr));
+    size_t next_size = GET_SIZE(GET_NEXT_HDRP(ptr));
+
+    size_t *prev_block = PREV_BLKP(ptr);
+    size_t *next_block = NEXT_BLKP(ptr);
+    size_t *new_block;
+    size_t total_size, new_block_size;
+
+    // data size to copy/move
+    size_t data_size = (asize < cur_size ? asize : cur_size) - DSIZE;
+    if(prev_free && next_free && prev_size + cur_size + next_size >= asize) {
+        // utilize both side
+        total_size = prev_size + cur_size + next_size;
+        remove_from_free_list(prev_block);
+        remove_from_free_list(next_block);
+        ptr = memmove(prev_block, ptr, data_size);        
+    } else if(!prev_free && next_free && cur_size + next_size >= asize) {
+        // utilize next side 
+        total_size = cur_size + next_size;
+        remove_from_free_list(next_block);
+    } else if(prev_free && !next_free && prev_size + cur_size >= asize) {
+        // utilize prev side
+        total_size = prev_size + cur_size;
+        remove_from_free_list(prev_block);
+        ptr = memmove(prev_block, ptr, data_size);        
+    } else if(!prev_free && !next_free && cur_size >= asize) {
+        total_size = cur_size;
+    } else {
+        // in this case, we will use simply malloc & free.. 
+        size_t *temp = mm_malloc(asize);
+        memcpy(temp, ptr, data_size);
+        mm_free(ptr);
+
+        return temp;
+    }
+
+    new_block_size = total_size - asize;
+
+    // determine to split
+    if(new_block_size >= MIN_BLOCK_SIZE) {
+        // split
+        // set header & footer
+        PUT(HDRP(ptr), PACK(asize, 0));
+        PUT(FTRP(ptr), PACK(asize, 0));
+
+        // set new block
+        new_block = FTRP(ptr) + 2;
+        PUT(HDRP(new_block), PACK(new_block_size, 1));
+        PUT(FTRP(new_block), PACK(new_block_size, 1));
+        insert_to_free_list(new_block);
+    } else {
+        // non-split
+        PUT(HDRP(ptr), PACK(total_size, 0));
+        PUT(FTRP(ptr), PACK(total_size, 0));
+        new_block = NULL;
+    }
+
+#ifdef DEBUG
+    printf("reallocate block %p(%d) ", oldptr, cur_size);
+    printf("coalesce:");
+    if(prev_free) printf(" %p(%d)", prev_block, prev_size);
+    if(next_free) printf(", %p(%d)", next_block, next_size);
+    printf("\nto block %p(%d)\n", ptr, asize);
+    if(new_block) {
+        printf("new ");
+        dump_block(new_block);
+        dump_extra(new_block);
+        dump_link(new_block);
+    }
+    mm_dump("realloc", oldptr, asize);
+#endif
+
+    return ptr;
 }
 
 void handle_error(size_t *bp, char *msg) {
