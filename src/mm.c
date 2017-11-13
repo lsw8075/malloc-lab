@@ -1,5 +1,5 @@
 /*
- * mm-realloc.c - The first-fit, LIFO explcit free list based malloc package with better realloc.
+ * mm-seg.c - The segregated-fit, LIFO explcit free list based malloc package with better realloc.
  *
  */
 
@@ -45,8 +45,6 @@
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 
-// size_t version of 
-
 // use alloc bit as free bit
 // if alloc bit is 0, it indicates allocated block
 // if alloc bit is 1, it indicates free block
@@ -66,13 +64,82 @@
 #define PREDP(fbp) ((size_t **)(fbp))
 #define SUCCP(fbp) ((size_t **)((char *)(fbp) + WSIZE))
 
+// for segragated-fit
+
+// in here, lists are 2^4.., 2^5.., ... 2^12...
+// the count must be odd number, as 8-byte alignment of block
+#define SEGLIST_COUNT 9
+
+// each seglist has own epilogs and prologs
+// all the epilog & prologs are 3-WORD size
+// epilog has header, pred, succ of each seglist
+// prolog has footer, pred, succ of each seglist
+
+#define EPILOG_SIZE (SEGLIST_COUNT * 3 * WSIZE)
+#define PROLOG_SIZE (EPILOG_SIZE)
+
+// debug option
 #define DEBUG
 
 #define BOLDSTART ""//"\033[1m"
 #define BOLDEND ""//"\033[0m"
-// pointers
-size_t *first_block, *prolog_block, *epilog_block;
 
+// global pointers
+static size_t *ptr_heap, heap_size;
+
+// seglist functions
+
+static int seglist_no(size_t v) {
+    // performs integer log 2
+    // (from 'Bit twiddling hacks' by Sean Anderson)
+    size_t r, shift;
+    r = (v > 0xFFFF)   << 4; v >>= r;
+    shift = (v > 0xFF) << 3; v >>= shift; r |= shift;
+    shift = (v > 0xF)  << 2; v >>= shift; r |= shift;
+    shift = (v > 0x3)  << 1; v >>= shift; r |= shift;
+                                          r |= (v >> 1);
+    // seglist starts with 2^4..2^5-1, so 4 is index 0
+    int x = (int)r - 4;
+    if(x < 0) x = 0;
+    if(x >= SEGLIST_COUNT) x = SEGLIST_COUNT - 1;
+    return x;
+}
+
+// helper macros
+#define get_overall_prolog_start() (ptr_heap)
+#define get_prolog_block(no) (get_overall_prolog_start() + (no) * 3)
+#define get_first_block(no) (*SUCCP(get_prolog_block(no)))
+#define get_overall_first_block() (get_overall_prolog_start() + (SEGLIST_COUNT * 3 + 1))
+#define get_overall_epilog_start() ((size_t *)((char *)(ptr_heap) + ((heap_size) - EPILOG_SIZE)))
+#define get_epilog_block(no) (get_overall_epilog_start() + ((no) * 3 + 1))
+
+static void init_seglist() {
+    int i;
+    size_t *p = ptr_heap;
+    size_t *pro = get_overall_prolog_start(), *epi = get_overall_epilog_start();
+
+    // heap starts with prolog list
+    // init prolog list
+    for(i=0; i<SEGLIST_COUNT; i++) {
+        *(p++) = 0;
+        *(p++) = (size_t)(epi + 1);
+        *(p++) = 0;
+        epi += 3;
+    }
+    // init epilog list
+    for(i=0; i<SEGLIST_COUNT; i++) {
+        *(p++) = 0;
+        *(p++) = (size_t)(pro);
+        *(p++) = 0;
+        pro += 3;
+    }
+}
+
+static size_t *get_overall_last_block() {
+    size_t *last_ftrp = get_overall_epilog_start() - 1;
+    if(!last_ftrp) return NULL;
+    return (size_t *)((char *)last_ftrp - GET_SIZE(last_ftrp) + DSIZE);
+}
 
 //debug functions
 
@@ -80,11 +147,11 @@ static void dump_funcname(char *name) {
     printf("====== function %s%s%s ======\n", BOLDSTART, name, BOLDEND);
 }
 
-static void dump_block(void *bp) {
+static void dump_block(size_t *bp) {
     printf("%s#block%s %p(%d, %s)\n", BOLDSTART, BOLDEND, bp, GET_SIZE(HDRP(bp)), GET_FREE_BIT(HDRP(bp)) ? "free" : "alloc");
 }
 
-static void dump_extra(void *bp) {
+static void dump_extra(size_t *bp) {
     char p_open, p_close;
     if(GET_FREE_BIT(HDRP(bp))) p_open = '[', p_close = ']';
     else p_open = '(', p_close = ')';
@@ -92,17 +159,76 @@ static void dump_extra(void *bp) {
     printf("  HDR: %p%c%d%c FTR: %p%c%d%c\n", HDRP(bp), p_open, GET_SIZE(HDRP(bp)), p_close, FTRP(bp), p_open, GET_SIZE(FTRP(bp)), p_close);
 }
 
-static void dump_link(void *bp) {
+static void dump_link(size_t *bp) {
+    int is_prolog = bp < get_overall_first_block();
+    int is_epilog = get_overall_epilog_start() <= bp;
+    int prolog_no = (bp - get_overall_prolog_start()) / 3;
+    int epilog_no = (bp - get_overall_epilog_start()) / 3;
+    
+    char str_prolog[32] = "", str_epilog[32] = "";
+
+    if(is_prolog) sprintf(str_prolog, "(prolog of %d)", prolog_no);
+    if(is_epilog) sprintf(str_epilog, "(epilog of %d)", epilog_no);
+
     if(GET_FREE_BIT(HDRP(bp))) {
-        printf("  PRED: %p%s SUCC: %p%s\n", *PREDP(bp), *PREDP(bp) == prolog_block ? "(prolog)" : "", *SUCCP(bp), *SUCCP(bp) == epilog_block ? "(epilog)" : "");
+        printf("  PRED: %p%s SUCC: %p%s\n", *PREDP(bp), str_prolog, *SUCCP(bp), str_epilog);
     }
 }
 
-int mm_dump(char *str, void *addr, int s)
+
+void handle_error(size_t *bp, char *msg) {
+    printf("<<<<<<%s>>>>>>\n", msg);
+    if(bp) {
+        dump_block(bp);
+        dump_extra(bp);
+        if(GET_FREE_BIT(HDRP(bp)))
+            dump_link(bp);
+    }
+    exit(1);
+}
+
+int mm_check(void) {
+    // check all blocks are in free list is really free
+    
+    size_t *cur_block;
+
+    cur_block = get_overall_first_block(); // first block of block list
+
+    // loop in block list until first epliog block
+    while(*HDRP(cur_block)) {
+        // check if current block header and footer are same
+        if(*HDRP(cur_block) != *FTRP(cur_block))
+            handle_error(cur_block, "header and footer are mismatch");
+        if(GET_FREE_BIT(HDRP(cur_block))) {
+            // check coalescing
+            if(GET_FREE_BIT(GET_PREV_FTRP(cur_block)))
+                handle_error(cur_block, "prev coalescing error");
+            if(GET_FREE_BIT(GET_NEXT_HDRP(cur_block)))
+                handle_error(cur_block, "next coalescing error");
+        }
+        cur_block = NEXT_BLKP(cur_block);
+    }
+
+    // loop in free list until epliog block
+    int no;
+    for(no=0; no<SEGLIST_COUNT; no++) {
+        cur_block = get_first_block(no); // first block of each free list
+        while(*HDRP(cur_block)) {
+            // check every block in the free list is really free
+            if(!GET_FREE_BIT(HDRP(cur_block)))
+                handle_error(cur_block, "allocated block in free list");
+            cur_block = *SUCCP(cur_block);
+        }
+    }
+    
+    return 1;
+}
+
+static int mm_dump(char *str, void *addr, int s)
 {
     printf("===starting mem dump : %s(%p, %d)===\n", str, addr, s);
     // print current memory state
-    size_t *cur_block = prolog_block + 4;
+    size_t *cur_block = get_overall_first_block();
     while(*HDRP(cur_block)) {
         dump_block(cur_block);
         dump_extra(cur_block);
@@ -114,12 +240,15 @@ int mm_dump(char *str, void *addr, int s)
     return mm_check();
 }
 
-void insert_to_free_list(size_t *bp) {
+// list functions
 
-    // use LIFO strategy
-    size_t *pred_free = prolog_block;
-    size_t *succ_free = first_block;
-    first_block = bp;
+static void insert_to_free_list(size_t *bp) {
+
+    int which_list = seglist_no(GET_SIZE(HDRP(bp)));
+
+    // use LIFO strategy at seglist
+    size_t *pred_free = get_prolog_block(which_list);
+    size_t *succ_free = get_first_block(which_list);
 
     *PREDP(bp) = pred_free;
     *SUCCP(bp) = succ_free;
@@ -129,13 +258,10 @@ void insert_to_free_list(size_t *bp) {
 
 }
 
-void remove_from_free_list(size_t *bp) {
+static void remove_from_free_list(size_t *bp) {
 
     size_t *pred_free = *PREDP(bp);
     size_t *succ_free = *SUCCP(bp);
-
-    if(first_block == bp)
-        first_block = succ_free;
 
     *SUCCP(pred_free) = succ_free;
     *PREDP(succ_free) = pred_free;
@@ -147,21 +273,13 @@ int mm_init(void) {
     dump_funcname("mm_init");
 #endif
 
-    size_t * ptr_heap = mem_sbrk(WSIZE * 6);
-    prolog_block = ptr_heap;
-    first_block = epilog_block = ptr_heap + 4;
-    // initialize prolog & epilog
-    // their free bit is not set, but do have PRED/SUCC ptr
-    *(ptr_heap++) = 0;                      // prolog PRED
-    *(ptr_heap++) = (size_t) epilog_block;  // prolog SUCC
-    *(ptr_heap++) = 0;                      // prolog footer
-    *(ptr_heap++) = 0;                      // epilog header
-    *(ptr_heap++) = (size_t) prolog_block;  // epilog PRED
-    *(ptr_heap++) = 0;                      // epilog SUCC
+    heap_size = PROLOG_SIZE + EPILOG_SIZE;
+    ptr_heap = mem_sbrk(heap_size);
 
-#ifdef DEBUG
-    printf("prolog: %p, epilog: %p\n", prolog_block, epilog_block);
-#endif
+    // initialize prolog & epilogs of each seglist
+
+    init_seglist();
+
     return 0;
 }
 
@@ -170,10 +288,14 @@ static size_t get_adjusted_size(size_t size) {
     return ALIGN(size) + DSIZE;
 }
 
-static void *find_fit(size_t size) {
+
+static void *find_fit(size_t size, int start_no) {
+
+    if(start_no >= SEGLIST_COUNT)
+        return NULL; // no block found. expansion needed;
 
     // start at first block of free list
-    size_t *cur_block = first_block;
+    size_t *cur_block = get_first_block(start_no);
 
     // loop until epliog block
     while(*HDRP(cur_block)) {
@@ -181,33 +303,42 @@ static void *find_fit(size_t size) {
             return cur_block;
         cur_block = *SUCCP(cur_block);
     }
-    
-    return NULL;
+
+    // if block is not found, search larger seglist
+    return find_fit(size, start_no + 1);
 }
 
-void expand_heap(size_t size) {
 
-    // save the epilog pred info
-    size_t *epilog_pred = *PREDP(epilog_block);
+static void expand_heap(size_t size) {
 
-    size_t *new_epilog = (size_t *)((char *)mem_sbrk(size) + size) - 2;
-    
-    // if epilog was first free block, shift it's location
-    if(first_block == epilog_block)
-        first_block = new_epilog;
+    size_t *old_epilog_start = get_overall_epilog_start();
+    size_t *new_epilog_start = (size_t *)((char *)mem_sbrk(size) + size - EPILOG_SIZE);
 
-    epilog_block = new_epilog;
-    // set the new epilog block
-    PUT(epilog_block - 1, 0);
-    PUT(epilog_block, (size_t)epilog_pred);
-    PUT(epilog_block + 1, 0);
+    if(!new_epilog_start) {
+        handle_error(NULL, "Out of memory");
+    }
 
-    // update the list bottom
-    *SUCCP(epilog_pred) = epilog_block;
+    heap_size += size;
+
+    // first, move epilog
+    memmove(new_epilog_start, old_epilog_start, EPILOG_SIZE);
+
+    // update SUCC of epilog pred
+
+    int i;
+    size_t *each_epilog = new_epilog_start;
+    for(i=0; i<SEGLIST_COUNT; i++)
+        *SUCCP(*PREDP(each_epilog)) = each_epilog;
     
 #ifdef DEBUG
-    printf("expand heap in %d bytes.. new epilog at %p\n", size, epilog_block);
+    printf("expand heap in %d bytes.. new epilog blocks\n", size);
 #endif
+}
+
+static void place(size_t *addr, size_t size, int is_free) {
+    // place block header and footer
+    PUT(HDRP(addr), PACK(size, is_free));
+    PUT(FTRP(addr), PACK(size, is_free));
 }
 
 // caution at malloc and free:
@@ -230,8 +361,8 @@ void *mm_malloc(size_t size) {
     printf("size: %d -> %d\n", size, asize);
 #endif
 
-    // find fit
-    if((bp = find_fit(asize))) {
+    // find fit, starting smallest possible seglist
+    if((bp = find_fit(asize, seglist_no(asize)))) {
         // if fit is found
         remove_from_free_list(bp);
         // check whether splitting is possible  
@@ -239,30 +370,20 @@ void *mm_malloc(size_t size) {
         if(block_size - asize >= MIN_BLOCK_SIZE) {
 
             // case: split
-            // first, place the block
-            PUT(HDRP(bp), PACK(asize, 0));
-            PUT(FTRP(bp), PACK(asize, 0));
-
-            // and place free area
             size_t * free_area = NEXT_BLKP(bp);
-            size_t free_size = block_size - asize;
-            PUT(HDRP(free_area), PACK(free_size, 1));
-            PUT(FTRP(free_area), PACK(free_size, 1));
-
+            place(bp, asize, 0);
+            place(free_area, block_size - asize, 1);
             insert_to_free_list(free_area);
 
 #ifdef DEBUG
-            printf("found fit at %p: %d ==split==> %d + %d\n", bp, block_size, asize, free_size);
+            printf("found fit at %p: %d ==split==> %d + %d\n", bp, block_size, asize, block_size - asize);
             dump_extra(bp);
             dump_extra(free_area);
 #endif
 
         } else {
             // non-split
-            
-            // place the block to original block size
-            PUT(HDRP(bp), PACK(block_size, 0));
-            PUT(FTRP(bp), PACK(block_size, 0));
+            place(bp, block_size, 0);
 #ifdef DEBUG
             printf("found fit at %p: %d of %d\n", bp, block_size, asize);
             dump_extra(bp);
@@ -273,20 +394,19 @@ void *mm_malloc(size_t size) {
         // expand the heap if fails
 
         // if last block is free area
-        if(GET_FREE_BIT(GET_PREV_FTRP(epilog_block))) {
-            bp = PREV_BLKP(epilog_block);
+        if(GET_FREE_BIT(get_overall_epilog_start() - 1)) {
+            bp = get_overall_last_block();
             remove_from_free_list(bp);
             size_t last_block_size = GET_SIZE(HDRP(bp));
             expand_heap(asize - last_block_size);
         } else {
             // set bp at the position of old epilog
-            bp = epilog_block;
+            bp = get_overall_epilog_start();
             expand_heap(asize);
         }
 
         // set the new block at bp
-        PUT(HDRP(bp), PACK(asize, 0));
-        PUT(FTRP(bp), PACK(asize, 0));
+        place(bp, asize, 0);
     }
 
 #ifdef DEBUG
@@ -303,10 +423,8 @@ void mm_free(void *ptr)
 
     size_t size = GET_SIZE(HDRP(bp));
 
-    PUT(HDRP(bp), PACK(size, 1));
-    PUT(FTRP(bp), PACK(size, 1));
+    place(ptr, size, 1);
 
-    // coalesce blocks
     size_t prev_free = GET_FREE_BIT(GET_PREV_FTRP(bp));
     size_t next_free = GET_FREE_BIT(GET_NEXT_HDRP(bp));
 
@@ -316,13 +434,14 @@ void mm_free(void *ptr)
 #ifdef DEBUG
     dump_funcname("mm_free");
     printf("freeing block at %p(%d) ", bp, size);
-    printf("coalesce:");
+    if(prev_free | next_free) printf("coalesce:");
     if(prev_free) printf(" %p", prev_block);
     if(next_free) printf(", %p",next_block);
     printf("\n");
     dump_extra(bp);
 #endif
 
+    // coalesce blocks
     if(prev_free && next_free) {
         remove_from_free_list(prev_block);
         remove_from_free_list(next_block);
@@ -353,10 +472,6 @@ void mm_free(void *ptr)
 #endif
 }
 
-size_t mm_size(void *ptr) {
-    return GET_SIZE(HDRP(ptr)) - DSIZE;
-}
-
 void *mm_realloc(void *ptr, size_t size)
 {
 #ifdef DEBUG
@@ -376,6 +491,7 @@ void *mm_realloc(void *ptr, size_t size)
     size_t cur_size = GET_SIZE(HDRP(ptr));
 
     void * oldptr = ptr;
+
 #ifdef DEBUG
     printf("realloc %p(%d -> %d)\n", ptr, cur_size, asize);
 #endif
@@ -393,7 +509,7 @@ void *mm_realloc(void *ptr, size_t size)
     size_t total_size, new_block_size;
 
     // check is expandable block..
-    size_t is_last = !GET_NEXT_HDRP(ptr);
+    size_t is_last = get_overall_last_block() == ptr;
     
     // data size to copy/move
     size_t data_size = (asize < cur_size ? asize : cur_size) - DSIZE;
@@ -431,8 +547,7 @@ void *mm_realloc(void *ptr, size_t size)
         // expand the heap
         expand_heap(asize - total_size);
 
-        PUT(HDRP(ptr), PACK(asize, 0));
-        PUT(FTRP(ptr), PACK(asize, 0));
+        place(ptr, asize, 0);
         new_block = NULL;
     } else {
 
@@ -442,18 +557,15 @@ void *mm_realloc(void *ptr, size_t size)
         if(new_block_size >= MIN_BLOCK_SIZE) {
             // split
             // set header & footer
-            PUT(HDRP(ptr), PACK(asize, 0));
-            PUT(FTRP(ptr), PACK(asize, 0));
+            place(ptr, asize, 0);
 
             // set new block
             new_block = FTRP(ptr) + 2;
-            PUT(HDRP(new_block), PACK(new_block_size, 1));
-            PUT(FTRP(new_block), PACK(new_block_size, 1));
+            place(new_block, new_block_size, 1);
             insert_to_free_list(new_block);
         } else {
             // non-split
-            PUT(HDRP(ptr), PACK(total_size, 0));
-            PUT(FTRP(ptr), PACK(total_size, 0));
+            place(ptr, total_size, 0);
             new_block = NULL;
         }
     }
@@ -474,48 +586,4 @@ void *mm_realloc(void *ptr, size_t size)
 #endif
 
     return ptr;
-}
-
-void handle_error(size_t *bp, char *msg) {
-    printf("<<<<<<%s>>>>>>\n", msg);
-    dump_block(bp);
-    dump_extra(bp);
-    if(GET_FREE_BIT(HDRP(bp)))
-        dump_link(bp);
-    exit(1);
-}
-int mm_check(void) {
-    // check all blocks are in free list is really free
-    
-    size_t *cur_block;
-
-    cur_block = prolog_block + 4; // first block of block list
-
-    // loop in block list until epliog block
-    while(*HDRP(cur_block)) {
-        // check if current block header and footer are same
-        if(*HDRP(cur_block) != *FTRP(cur_block))
-            handle_error(cur_block, "header and footer are mismatch");
-        if(GET_FREE_BIT(HDRP(cur_block))) {
-            // check coalescing
-            if(GET_FREE_BIT(GET_PREV_FTRP(cur_block)))
-                handle_error(cur_block, "prev coalescing error");
-            if(GET_FREE_BIT(GET_NEXT_HDRP(cur_block)))
-                handle_error(cur_block, "next coalescing error");
-            
-            // TODO : check missing free block
-        }
-        cur_block = NEXT_BLKP(cur_block);
-    }
-
-    // loop in free list until epliog block
-    cur_block = first_block; // first block of free list
-    while(*HDRP(cur_block)) {
-        // check every block in the free list is really free
-        if(!GET_FREE_BIT(HDRP(cur_block)))
-            handle_error(cur_block, "allocated block in free list");
-        cur_block = *SUCCP(cur_block);
-    }
-    
-    return 1;
 }
