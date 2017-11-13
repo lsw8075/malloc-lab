@@ -66,8 +66,10 @@
 #define PREDP(fbp) ((size_t **)(fbp))
 #define SUCCP(fbp) ((size_t **)((char *)(fbp) + WSIZE))
 
-#define BOLDSTART "\033[1m"
-#define BOLDEND "\033[0m"
+#define DEBUG
+
+#define BOLDSTART ""//"\033[1m"
+#define BOLDEND ""//"\033[0m"
 // pointers
 size_t *first_block, *prolog_block, *epilog_block;
 
@@ -183,6 +185,31 @@ static void *find_fit(size_t size) {
     return NULL;
 }
 
+void expand_heap(size_t size) {
+
+    // save the epilog pred info
+    size_t *epilog_pred = *PREDP(epilog_block);
+
+    size_t *new_epilog = (size_t *)((char *)mem_sbrk(size) + size) - 2;
+    
+    // if epilog was first free block, shift it's location
+    if(first_block == epilog_block)
+        first_block = new_epilog;
+
+    epilog_block = new_epilog;
+    // set the new epilog block
+    PUT(epilog_block - 1, 0);
+    PUT(epilog_block, (size_t)epilog_pred);
+    PUT(epilog_block + 1, 0);
+
+    // update the list bottom
+    *SUCCP(epilog_pred) = epilog_block;
+    
+#ifdef DEBUG
+    printf("expand heap in %d bytes.. new epilog at %p\n", size, epilog_block);
+#endif
+}
+
 // caution at malloc and free:
 // the update order of header and footer matter
 // as we get the size at the header
@@ -243,54 +270,24 @@ void *mm_malloc(size_t size) {
         }
         
     } else {
-        // extend the heap if fails
-#ifdef DEBUG
-        printf("extending heap..\n");
-#endif
+        // expand the heap if fails
 
         // if last block is free area
         if(GET_FREE_BIT(GET_PREV_FTRP(epilog_block))) {
             bp = PREV_BLKP(epilog_block);
             remove_from_free_list(bp);
             size_t last_block_size = GET_SIZE(HDRP(bp));
-            // expand the difference
-            mem_sbrk(asize - last_block_size);
+            expand_heap(asize - last_block_size);
         } else {
-            bp = (size_t *) mem_sbrk(asize);
-            bp -= 2;
-            if(!bp) return NULL;
+            // set bp at the position of old epilog
+            bp = epilog_block;
+            expand_heap(asize);
         }
 
-        // save the epilog pred info
-        size_t *epilog_pred = *PREDP(epilog_block);
-
-        // now bp points to preparatory new block..
         // set the new block at bp
         PUT(HDRP(bp), PACK(asize, 0));
-        
-        size_t * ftr = FTRP(bp);
-        PUT(ftr, PACK(asize, 0));
-      
-        // if epilog was first free block, shift it's location
-        if(first_block == epilog_block)
-            first_block = ftr + 2;
-
-        epilog_block = ftr + 2; 
-        // set the new epilog block
-        PUT(epilog_block - 1, 0);
-        PUT(epilog_block, (size_t)epilog_pred);
-        PUT(epilog_block + 1, 0);
-
-        // update the list bottom
-        *SUCCP(epilog_pred) = epilog_block;
-        
-        
-#ifdef DEBUG
-        printf("extend heap at %p: %d\n", bp, asize);
-        dump_extra(bp);
-        printf("new epilog at %p\n", epilog_block);
-#endif
-    } 
+        PUT(FTRP(bp), PACK(asize, 0));
+    }
 
 #ifdef DEBUG
     mm_dump("malloc", bp, asize);
@@ -395,24 +392,27 @@ void *mm_realloc(void *ptr, size_t size)
     size_t *new_block;
     size_t total_size, new_block_size;
 
+    // check is expandable block..
+    size_t is_last = !GET_NEXT_HDRP(ptr);
+    
     // data size to copy/move
     size_t data_size = (asize < cur_size ? asize : cur_size) - DSIZE;
-    if(prev_free && next_free && prev_size + cur_size + next_size >= asize) {
+    if(prev_free && next_free && (prev_size + cur_size + next_size >= asize || is_last)) {
         // utilize both side
         total_size = prev_size + cur_size + next_size;
         remove_from_free_list(prev_block);
         remove_from_free_list(next_block);
         ptr = memmove(prev_block, ptr, data_size);        
-    } else if(!prev_free && next_free && cur_size + next_size >= asize) {
+    } else if(!prev_free && next_free && (cur_size + next_size >= asize || is_last)) {
         // utilize next side 
         total_size = cur_size + next_size;
         remove_from_free_list(next_block);
-    } else if(prev_free && !next_free && prev_size + cur_size >= asize) {
+    } else if(prev_free && !next_free && (prev_size + cur_size >= asize || is_last)) {
         // utilize prev side
         total_size = prev_size + cur_size;
         remove_from_free_list(prev_block);
         ptr = memmove(prev_block, ptr, data_size);        
-    } else if(!prev_free && !next_free && cur_size >= asize) {
+    } else if(!prev_free && !next_free && (cur_size >= asize || is_last)) {
         total_size = cur_size;
     } else {
         // in this case, we will use simply malloc & free.. 
@@ -423,25 +423,39 @@ void *mm_realloc(void *ptr, size_t size)
         return temp;
     }
 
-    new_block_size = total_size - asize;
+    if(total_size < asize) {
+        if(!is_last) {
+            handle_error(ptr, "Illegal condition check in realloc");
+            exit(1);
+        }
+        // expand the heap
+        expand_heap(asize - total_size);
 
-    // determine to split
-    if(new_block_size >= MIN_BLOCK_SIZE) {
-        // split
-        // set header & footer
         PUT(HDRP(ptr), PACK(asize, 0));
         PUT(FTRP(ptr), PACK(asize, 0));
-
-        // set new block
-        new_block = FTRP(ptr) + 2;
-        PUT(HDRP(new_block), PACK(new_block_size, 1));
-        PUT(FTRP(new_block), PACK(new_block_size, 1));
-        insert_to_free_list(new_block);
-    } else {
-        // non-split
-        PUT(HDRP(ptr), PACK(total_size, 0));
-        PUT(FTRP(ptr), PACK(total_size, 0));
         new_block = NULL;
+    } else {
+
+        new_block_size = total_size - asize;
+
+        // determine to split
+        if(new_block_size >= MIN_BLOCK_SIZE) {
+            // split
+            // set header & footer
+            PUT(HDRP(ptr), PACK(asize, 0));
+            PUT(FTRP(ptr), PACK(asize, 0));
+
+            // set new block
+            new_block = FTRP(ptr) + 2;
+            PUT(HDRP(new_block), PACK(new_block_size, 1));
+            PUT(FTRP(new_block), PACK(new_block_size, 1));
+            insert_to_free_list(new_block);
+        } else {
+            // non-split
+            PUT(HDRP(ptr), PACK(total_size, 0));
+            PUT(FTRP(ptr), PACK(total_size, 0));
+            new_block = NULL;
+        }
     }
 
 #ifdef DEBUG
