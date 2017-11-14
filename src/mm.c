@@ -66,7 +66,7 @@
 
 // for segragated-fit
 
-// in here, lists are 2^4.., 2^5.., ... 2^12...
+// in here, lists are 2^4.., 2^5.., ... 2^14...
 // the count must be odd number, as 8-byte alignment of block
 #define SEGLIST_COUNT 9
 
@@ -79,7 +79,6 @@
 #define PROLOG_SIZE (EPILOG_SIZE)
 
 // debug option
-#define DEBUG
 
 #define BOLDSTART ""//"\033[1m"
 #define BOLDEND ""//"\033[0m"
@@ -114,25 +113,38 @@ static int seglist_no(size_t v) {
 #define get_epilog_block(no) (get_overall_epilog_start() + ((no) * 3 + 1))
 
 static void init_seglist() {
+#ifdef DEBUG
+    printf("initing seglist..\n");
+#endif
     int i;
     size_t *p = ptr_heap;
-    size_t *pro = get_overall_prolog_start(), *epi = get_overall_epilog_start();
+    size_t *pro = get_overall_prolog_start(), *epi = get_overall_epilog_start() + 1;
 
     // heap starts with prolog list
     // init prolog list
     for(i=0; i<SEGLIST_COUNT; i++) {
-        *(p++) = 0;
-        *(p++) = (size_t)(epi + 1);
-        *(p++) = 0;
+        *p = 0; p++;
+        *p = (size_t)(epi); p++;
+        *p = 0; p++;
         epi += 3;
     }
     // init epilog list
     for(i=0; i<SEGLIST_COUNT; i++) {
-        *(p++) = 0;
-        *(p++) = (size_t)(pro);
-        *(p++) = 0;
+        *p = 0; p++;
+        *p = (size_t)(pro); p++;
+        *p = 0; p++;
         pro += 3;
     }
+#ifdef DEBUG
+    p = ptr_heap;
+    for(i=0; i<SEGLIST_COUNT * 2; i++) {
+        printf("initialize %p(%s %d): %d %p %d\n", p+3*i, i/SEGLIST_COUNT ? "epilog" : "prolog",
+            i%SEGLIST_COUNT, *(p+3*i), *(p+3*i+1), *(p+3*i+2));
+    }
+
+    // test helper macros
+    printf("prolog starts at %p, epilog starts at %p\n", get_overall_prolog_start(), get_overall_epilog_start());
+#endif
 }
 
 static size_t *get_overall_last_block() {
@@ -142,6 +154,10 @@ static size_t *get_overall_last_block() {
 }
 
 //debug functions
+
+static void dtag(int n) {
+    printf("%d\n", n);
+}
 
 static void dump_funcname(char *name) {
     printf("====== function %s%s%s ======\n", BOLDSTART, name, BOLDEND);
@@ -160,17 +176,17 @@ static void dump_extra(size_t *bp) {
 }
 
 static void dump_link(size_t *bp) {
-    int is_prolog = bp < get_overall_first_block();
-    int is_epilog = get_overall_epilog_start() <= bp;
-    int prolog_no = (bp - get_overall_prolog_start()) / 3;
-    int epilog_no = (bp - get_overall_epilog_start()) / 3;
-    
-    char str_prolog[32] = "", str_epilog[32] = "";
-
-    if(is_prolog) sprintf(str_prolog, "(prolog of %d)", prolog_no);
-    if(is_epilog) sprintf(str_epilog, "(epilog of %d)", epilog_no);
-
     if(GET_FREE_BIT(HDRP(bp))) {
+
+        int is_prolog = *PREDP(bp) < get_overall_first_block();
+        int is_epilog = get_overall_epilog_start() <= *SUCCP(bp);
+        int prolog_no = (*PREDP(bp) - get_overall_prolog_start()) / 3;
+        int epilog_no = (*SUCCP(bp) - get_overall_epilog_start()) / 3;
+        printf("%p\n", get_overall_epilog_start());
+        char str_prolog[32] = "", str_epilog[32] = "";
+        if(is_prolog) sprintf(str_prolog, "(prolog of %d)", prolog_no);
+        if(is_epilog) sprintf(str_epilog, "(epilog of %d)", epilog_no);
+
         printf("  PRED: %p%s SUCC: %p%s\n", *PREDP(bp), str_prolog, *SUCCP(bp), str_epilog);
     }
 }
@@ -293,7 +309,9 @@ static void *find_fit(size_t size, int start_no) {
 
     if(start_no >= SEGLIST_COUNT)
         return NULL; // no block found. expansion needed;
-
+#ifdef DEBUG
+    printf("finding fit(%d) in list %d\n", size, start_no);
+#endif
     // start at first block of free list
     size_t *cur_block = get_first_block(start_no);
 
@@ -319,17 +337,16 @@ static void expand_heap(size_t size) {
     }
 
     heap_size += size;
-
     // first, move epilog
     memmove(new_epilog_start, old_epilog_start, EPILOG_SIZE);
-
     // update SUCC of epilog pred
 
     int i;
-    size_t *each_epilog = new_epilog_start;
-    for(i=0; i<SEGLIST_COUNT; i++)
+    size_t *each_epilog = new_epilog_start + 1;
+    for(i=0; i<SEGLIST_COUNT; i++) {
         *SUCCP(*PREDP(each_epilog)) = each_epilog;
-    
+        each_epilog += 3;
+    }
 #ifdef DEBUG
     printf("expand heap in %d bytes.. new epilog blocks\n", size);
 #endif
@@ -370,8 +387,8 @@ void *mm_malloc(size_t size) {
         if(block_size - asize >= MIN_BLOCK_SIZE) {
 
             // case: split
-            size_t * free_area = NEXT_BLKP(bp);
             place(bp, asize, 0);
+            size_t * free_area = NEXT_BLKP(bp);
             place(free_area, block_size - asize, 1);
             insert_to_free_list(free_area);
 
@@ -393,6 +410,9 @@ void *mm_malloc(size_t size) {
     } else {
         // expand the heap if fails
 
+#ifdef DEBUG
+        printf("try expansion...\n");
+#endif 
         // if last block is free area
         if(GET_FREE_BIT(get_overall_epilog_start() - 1)) {
             bp = get_overall_last_block();
@@ -401,7 +421,7 @@ void *mm_malloc(size_t size) {
             expand_heap(asize - last_block_size);
         } else {
             // set bp at the position of old epilog
-            bp = get_overall_epilog_start();
+            bp = get_overall_epilog_start() + 1;
             expand_heap(asize);
         }
 
