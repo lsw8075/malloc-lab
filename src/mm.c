@@ -1,6 +1,6 @@
 /*
  * mm-seg.c - The segregated-fit, LIFO explcit free list based malloc package with better realloc.
- *
+ * 
  */
 
 #include <stdio.h>
@@ -517,7 +517,9 @@ void *mm_realloc(void *ptr, size_t size)
 #endif
 
     // first check whether surrounding free blocks exist
-    size_t prev_free = GET_FREE_BIT(GET_PREV_FTRP(ptr));
+
+    // no coalescing with prev block
+    size_t prev_free = 0;//GET_FREE_BIT(GET_PREV_FTRP(ptr));
     size_t next_free = GET_FREE_BIT(GET_NEXT_HDRP(ptr));
 
     size_t prev_size = GET_SIZE(GET_PREV_FTRP(ptr));
