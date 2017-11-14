@@ -1,6 +1,42 @@
 /*
- * mm-seg.c - The segregated-fit, LIFO explcit free list based malloc package with better realloc.
- * 
+ * mm-seg.c - The segregated-fit, LIFO explcit free list based malloc package with better realloc (93/100).
+ *
+ * in 2017 Fall System Programming class in SNU
+ * by Seungwoo Lee
+ * 2017/11/14
+ *
+ * in this malloc-lab, our memory model is 32-bit
+ *
+ * overall heap structure:
+ *  - heap contains several segregated lists
+ *  - the number of seg-list is SEGLIST_COUNT(now 13)
+ *  - each seglist contains several free blocks,
+ *  - whose size are 2^4..2^5-1, 2^5..2^6-1, ... 2^15..2^16-1, 2^16..inf
+ *  - there are SEGLIST_COUNT prolog blocks at the heap start,
+ *  - and, also SEGLIST_COUNT epilog blocks at the heap end.
+ *  - between prologs and epilogs, there are N>=0 normal blocks.
+ *
+ * normal block structure
+ *  - a normal block is one of allocated block or free block
+ *  - every normal block has own header at the start and footer at the end.
+ *  - header/footer contains block size and one free bit.
+ *  - block size includes header and footer size
+ *  - free bit is set in case of free blocks, while not set in the allocated ones.
+ *  - a free block contains PRED and SUCC pointer,
+ *  - which points to it's predecessor and successor free block respectively.
+ *  - minimum block size is 16 byte
+ *
+ * prolog/epilog block structure
+ *  - one prolog block contains a PRED(always NULL), a SUCC, a footer(0).
+ *  - one epilog block contains a header(0), a PRED, a SUCC(always NULL).
+ *  - header and footer set to 0 as it is neither an allocated block, nor a free one.
+ *
+ * seg-list structure
+ *  - each seg-list is doubly linked list of free blocks
+ *  - there are prolog and epilog block on the each end of the seg-list.
+ *  - at first, each seg-list contains prolog and epilog block.
+ *  - we insert block into the seg-list corresponding to the block size.
+ *
  */
 
 #include <stdio.h>
@@ -68,7 +104,10 @@
 
 // in here, lists are 2^4.., 2^5.., ... 2^14...
 // the count must be odd number, as 8-byte alignment of block
-#define SEGLIST_COUNT 9
+#define SEGLIST_COUNT 13
+
+// if debug needed, enable this macro
+//#define DEBUG
 
 // each seglist has own epilogs and prologs
 // all the epilog & prologs are 3-WORD size
@@ -88,6 +127,7 @@ static size_t *ptr_heap, heap_size;
 
 // seglist functions
 
+// determine the which seg-list the free block should go, considering its size.. 
 static int seglist_no(size_t v) {
     // performs integer log 2
     // (from 'Bit twiddling hacks' by Sean Anderson)
@@ -112,6 +152,7 @@ static int seglist_no(size_t v) {
 #define get_overall_epilog_start() ((size_t *)((char *)(ptr_heap) + ((heap_size) - EPILOG_SIZE)))
 #define get_epilog_block(no) (get_overall_epilog_start() + ((no) * 3 + 1))
 
+// init seg-lists
 static void init_seglist() {
 #ifdef DEBUG
     printf("initing seglist..\n");
@@ -147,6 +188,7 @@ static void init_seglist() {
 #endif
 }
 
+// get the last block except epilog blocks.
 static size_t *get_overall_last_block() {
     size_t *last_ftrp = get_overall_epilog_start() - 1;
     if(!last_ftrp) return NULL;
@@ -155,18 +197,17 @@ static size_t *get_overall_last_block() {
 
 //debug functions
 
-static void dtag(int n) {
-    printf("%d\n", n);
-}
-
+// print fuction name
 static void dump_funcname(char *name) {
     printf("====== function %s%s%s ======\n", BOLDSTART, name, BOLDEND);
 }
 
+// dump block
 static void dump_block(size_t *bp) {
     printf("%s#block%s %p(%d, %s)\n", BOLDSTART, BOLDEND, bp, GET_SIZE(HDRP(bp)), GET_FREE_BIT(HDRP(bp)) ? "free" : "alloc");
 }
 
+// dump header & footer
 static void dump_extra(size_t *bp) {
     char p_open, p_close;
     if(GET_FREE_BIT(HDRP(bp))) p_open = '[', p_close = ']';
@@ -175,6 +216,7 @@ static void dump_extra(size_t *bp) {
     printf("  HDR: %p%c%d%c FTR: %p%c%d%c\n", HDRP(bp), p_open, GET_SIZE(HDRP(bp)), p_close, FTRP(bp), p_open, GET_SIZE(FTRP(bp)), p_close);
 }
 
+// dump link information
 static void dump_link(size_t *bp) {
     if(GET_FREE_BIT(HDRP(bp))) {
 
@@ -182,7 +224,6 @@ static void dump_link(size_t *bp) {
         int is_epilog = get_overall_epilog_start() <= *SUCCP(bp);
         int prolog_no = (*PREDP(bp) - get_overall_prolog_start()) / 3;
         int epilog_no = (*SUCCP(bp) - get_overall_epilog_start()) / 3;
-        printf("%p\n", get_overall_epilog_start());
         char str_prolog[32] = "", str_epilog[32] = "";
         if(is_prolog) sprintf(str_prolog, "(prolog of %d)", prolog_no);
         if(is_epilog) sprintf(str_epilog, "(epilog of %d)", epilog_no);
@@ -191,7 +232,7 @@ static void dump_link(size_t *bp) {
     }
 }
 
-
+// function for error handling
 void handle_error(size_t *bp, char *msg) {
     printf("<<<<<<%s>>>>>>\n", msg);
     if(bp) {
@@ -203,6 +244,7 @@ void handle_error(size_t *bp, char *msg) {
     exit(1);
 }
 
+// simple memory check function
 int mm_check(void) {
     // check all blocks are in free list is really free
     
@@ -240,6 +282,7 @@ int mm_check(void) {
     return 1;
 }
 
+// dump all normal blocks in the heap
 static int mm_dump(char *str, void *addr, int s)
 {
     printf("===starting mem dump : %s(%p, %d)===\n", str, addr, s);
@@ -258,6 +301,7 @@ static int mm_dump(char *str, void *addr, int s)
 
 // list functions
 
+// insert a free block into the seg-list, correspond to its size
 static void insert_to_free_list(size_t *bp) {
 
     int which_list = seglist_no(GET_SIZE(HDRP(bp)));
@@ -274,6 +318,7 @@ static void insert_to_free_list(size_t *bp) {
 
 }
 
+// remove a free block from seg-list
 static void remove_from_free_list(size_t *bp) {
 
     size_t *pred_free = *PREDP(bp);
@@ -283,6 +328,7 @@ static void remove_from_free_list(size_t *bp) {
     *PREDP(succ_free) = pred_free;
 }   
 
+// function for heap initialization
 int mm_init(void) {
 
 #ifdef DEBUG
@@ -299,11 +345,14 @@ int mm_init(void) {
     return 0;
 }
 
+// get adjusted block size including header and footer
 static size_t get_adjusted_size(size_t size) {
     // align block size to 8 byte
     return ALIGN(size) + DSIZE;
 }
 
+
+// find first-fit of size, starting at seglist of start_no, working recursively.
 
 static void *find_fit(size_t size, int start_no) {
 
@@ -326,7 +375,7 @@ static void *find_fit(size_t size, int start_no) {
     return find_fit(size, start_no + 1);
 }
 
-
+// expand heap & shift the epilogs
 static void expand_heap(size_t size) {
 
     size_t *old_epilog_start = get_overall_epilog_start();
@@ -339,8 +388,8 @@ static void expand_heap(size_t size) {
     heap_size += size;
     // first, move epilog
     memmove(new_epilog_start, old_epilog_start, EPILOG_SIZE);
-    // update SUCC of epilog pred
 
+    // update SUCC of epilog pred
     int i;
     size_t *each_epilog = new_epilog_start + 1;
     for(i=0; i<SEGLIST_COUNT; i++) {
@@ -352,16 +401,14 @@ static void expand_heap(size_t size) {
 #endif
 }
 
+// place the block
 static void place(size_t *addr, size_t size, int is_free) {
     // place block header and footer
     PUT(HDRP(addr), PACK(size, is_free));
     PUT(FTRP(addr), PACK(size, is_free));
 }
 
-// caution at malloc and free:
-// the update order of header and footer matter
-// as we get the size at the header
-
+// our malloc function: find fit, then alloc or split-alloc or expand
 void *mm_malloc(size_t size) {
 
 #ifdef DEBUG
@@ -437,6 +484,7 @@ void *mm_malloc(size_t size) {
 
 }
 
+// our free function: with coalescing
 void mm_free(void *ptr)
 {
     size_t *bp = (size_t *)ptr;
@@ -492,6 +540,7 @@ void mm_free(void *ptr)
 #endif
 }
 
+// our realloc function: try utilizing next block & autonomous heap expansion
 void *mm_realloc(void *ptr, size_t size)
 {
 #ifdef DEBUG
@@ -518,7 +567,7 @@ void *mm_realloc(void *ptr, size_t size)
 
     // first check whether surrounding free blocks exist
 
-    // no coalescing with prev block
+    // no utilizing with prev block.. it hinders overall utilization rate
     size_t prev_free = 0;//GET_FREE_BIT(GET_PREV_FTRP(ptr));
     size_t next_free = GET_FREE_BIT(GET_NEXT_HDRP(ptr));
 
